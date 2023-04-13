@@ -1,14 +1,17 @@
 package errgroup
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"sync"
 )
 
 type Group struct {
-	sem   chan struct{}
-	count int
-	errs  chan error
+	wg     sync.WaitGroup
+	cancel context.CancelFunc
+	sem    chan struct{}
+	errs   chan error
 }
 
 func New() *Group {
@@ -17,17 +20,28 @@ func New() *Group {
 	}
 }
 
+func WithContext(ctx context.Context) (*Group, context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+
+	return &Group{
+		errs:   make(chan error),
+		cancel: cancel,
+	}, ctx
+}
+
 func (g *Group) SetLimit(limit int) {
 	g.sem = make(chan struct{}, limit)
 }
 
 func (g *Group) Go(f func() error) {
+	g.wg.Add(1)
 	if g.sem != nil {
 		g.sem <- struct{}{}
 	}
-	g.count++
 
 	go func() {
+		defer g.wg.Done()
+
 		defer func() {
 			if r := recover(); r != nil {
 				var err error
@@ -48,20 +62,32 @@ func (g *Group) Go(f func() error) {
 		if g.sem != nil {
 			<-g.sem
 		}
-		g.errs <- err
+		if err != nil {
+			g.errs <- err
+		}
 	}()
 }
 
 func (g *Group) Wait() error {
 	var err error
 
-	for i := 0; i < g.count; i++ {
-		curr := <-g.errs
-		if curr != nil && err == nil {
+	go func() {
+		g.wg.Wait()
+		close(g.errs)
+	}()
+
+	for curr := range g.errs {
+		if err == nil {
 			err = curr
+		}
+		if g.cancel != nil {
+			g.cancel()
 		}
 	}
 
+	if g.cancel != nil {
+		g.cancel()
+	}
 	return err
 }
 
